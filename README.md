@@ -12,7 +12,7 @@ A [MoneyMoney](https://moneymoney-app.com) extension for **Bangkok Bank (BBL) Th
 ## Features
 
 - Supports **Savings, Current, Fixed Deposit** accounts in THB
-- Fetches up to **89 days** of transaction history per refresh
+- Fetches up to **365 days** of transaction history per refresh
 - Login via **headless Firefox** (Camoufox) — bypasses Akamai bot protection invisibly
 - Proxy runs **on demand only** via macOS Socket Activation — no background process when idle
 
@@ -72,7 +72,7 @@ On the first refresh, the proxy creates a self-signed certificate for `127.0.0.1
 ## Limitations
 
 - **THB only** — foreign currency accounts are not supported
-- **Max 89 days** of history per refresh (portal limitation)
+- **Max 365 days** of history per refresh (portal limitation)
 - Requires Python 3 and a one-time setup (no pure-Lua solution possible due to Akamai)
 
 ## Troubleshooting

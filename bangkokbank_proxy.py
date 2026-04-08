@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 """
-Bangkok Bank iBanking Proxy für MoneyMoney  –  v13
-==================================================
-Hybrid-Architektur:
-- Login  (POST /SignOn.aspx):  Camoufox headless Firefox (Akamai-JS-Challenge)
-                               Fallback: echtes Google Chrome via CDP
-- Danach (alle weiteren Req.): curl-cffi Chrome124-Impersonation mit Session-Cookies
+Bangkok Bank iBanking Proxy for MoneyMoney  –  v13
+===================================================
+Hybrid architecture:
+- Login  (POST /SignOn.aspx):  Camoufox headless Firefox (Akamai JS challenge)
+                               Fallback: real Google Chrome via CDP
+- All subsequent requests:     curl-cffi Chrome124 impersonation with session cookies
 
-Socket Activation (Normalbetrieb als LaunchAgent):
-  launchd hält Port 8765 dauerhaft. Der Proxy startet nur wenn MoneyMoney
-  eine Verbindung aufbaut und fährt nach 120s Inaktivität automatisch herunter.
-  launchd startet ihn beim nächsten Abruf wieder.
+Socket Activation (normal operation as LaunchAgent):
+  launchd holds port 8765 permanently. The proxy starts only when MoneyMoney
+  opens a connection and shuts down after 120s of inactivity.
+  launchd restarts it on the next request.
 
-Einmalige Installation:
+One-time installation:
     pip3 install curl-cffi camoufox --break-system-packages
     python3 -m camoufox fetch
 
-Fallback (wenn kein Camoufox):
+Fallback (if Camoufox is not available):
     pip3 install playwright --break-system-packages
-    Google Chrome muss installiert sein: /Applications/Google Chrome.app/
+    Google Chrome must be installed: /Applications/Google Chrome.app/
 
-Manueller Start (für Tests):
+Manual start (for testing):
     python3 bangkokbank_proxy.py
 """
 
-# Dock-Icon sofort unterdrücken – vor allen anderen Imports damit kein Flash entsteht
+# Suppress Dock icon immediately – before any other imports to avoid a flash
 try:
     import AppKit
     AppKit.NSApplication.sharedApplication().setActivationPolicy_(
@@ -47,7 +47,7 @@ try:
     from playwright.sync_api import sync_playwright
     PLAYWRIGHT_AVAILABLE = True
     USE_CAMOUFOX = True
-    print("Camoufox verfügbar – verwende headless Firefox für Login.", flush=True)
+    print("Camoufox available – using headless Firefox for login.", flush=True)
 except ImportError:
     try:
         from playwright.sync_api import sync_playwright
@@ -57,15 +57,15 @@ except ImportError:
     except ImportError:
         PLAYWRIGHT_AVAILABLE = False
         USE_CAMOUFOX = False
-        print("WARNUNG: weder camoufox noch playwright installiert – Login wird fehlschlagen.", flush=True)
+        print("WARNING: neither camoufox nor playwright installed – login will fail.", flush=True)
         print("  pip3 install camoufox --break-system-packages && python3 -m camoufox fetch", flush=True)
 
 import http.server, socketserver, threading, json, os, tempfile, gzip, zlib
 from io import BytesIO
 
 PORT         = 8765
-CDP_PORT     = 9223   # Nur für Chrome-CDP-Fallback
-IDLE_TIMEOUT = 120    # Sekunden Inaktivität bis zum automatischen Herunterfahren
+CDP_PORT     = 9223   # Only for Chrome CDP fallback
+IDLE_TIMEOUT = 120    # Seconds of inactivity before automatic shutdown
 
 TARGET       = "https://ibanking.bangkokbank.com"
 SUMMARY_PATH = "/workspace/16AccountActivity/wsp_AccountSummary_AccountSummaryPage.aspx"
@@ -91,7 +91,7 @@ def find_chrome():
 
 
 def _get_launchd_socket():
-    """Übernimmt den von launchd vorab gebundenen Socket (Socket Activation)."""
+    """Acquire the socket pre-bound by launchd (Socket Activation)."""
     try:
         lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
         fds  = ctypes.POINTER(ctypes.c_int)()
@@ -108,8 +108,8 @@ def _get_launchd_socket():
 
 
 def _reset_idle_timer(server):
-    """Setzt Inaktivitäts-Timer zurück. Nach IDLE_TIMEOUT Sekunden ohne Request fährt
-    der Proxy herunter; launchd startet ihn beim nächsten Abruf wieder."""
+    """Reset the inactivity timer. After IDLE_TIMEOUT seconds without a request
+    the proxy shuts down; launchd restarts it on the next request."""
     global _idle_timer
     with _idle_lock:
         if _idle_timer:
@@ -123,18 +123,18 @@ def _reset_idle_timer(server):
 
 
 class _PreBoundHTTPServer(http.server.HTTPServer):
-    """HTTPServer der einen bereits gebundenen launchd-Socket verwendet
-    (überspringt bind/listen da launchd das bereits erledigt hat)."""
+    """HTTPServer that uses a socket already bound by launchd
+    (skips bind/listen since launchd has already done that)."""
     def __init__(self, sock, handler):
         socketserver.BaseServer.__init__(self, sock.getsockname(), handler)
         self.socket = sock
 
 
 def ensure_tls_cert():
-    """Selbst-signiertes Zertifikat für localhost erstellen (einmalig)."""
+    """Create a self-signed certificate for localhost (one-time)."""
     if os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE):
         return
-    print("Erstelle selbst-signiertes TLS-Zertifikat für localhost...", flush=True)
+    print("Creating self-signed TLS certificate for localhost...", flush=True)
     subprocess.run([
         "openssl", "req", "-x509", "-newkey", "rsa:2048",
         "-keyout", KEY_FILE, "-out", CERT_FILE,
@@ -142,28 +142,28 @@ def ensure_tls_cert():
         "-subj", "/CN=127.0.0.1",
         "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost",
     ], check=True, capture_output=True)
-    print(f"Zertifikat erstellt: {CERT_FILE}", flush=True)
+    print(f"Certificate created: {CERT_FILE}", flush=True)
     keychain = os.path.expanduser("~/Library/Keychains/login.keychain-db")
     try:
         subprocess.run([
             "security", "add-trusted-cert", "-r", "trustRoot",
             "-k", keychain, CERT_FILE,
         ], check=True)
-        print("Zertifikat dem Keychain hinzugefügt.", flush=True)
+        print("Certificate added to Keychain.", flush=True)
     except subprocess.CalledProcessError:
-        print(f"\n⚠️  Bitte Zertifikat einmalig manuell vertrauen:\n"
+        print(f"\n⚠️  Please trust the certificate manually (one-time):\n"
               f"  security add-trusted-cert -r trustRoot -k {keychain} {CERT_FILE}\n",
               flush=True)
 
 
-# Von Chrome-Impersonation automatisch gesetzte Headers – nicht aus dem Lua-Request übernehmen,
-# da curl-cffi diese als Teil des Fingerprints selbst setzt.
+# Headers set automatically by Chrome impersonation – do not pass from the Lua request,
+# as curl-cffi sets these itself as part of the TLS fingerprint.
 CHROME_DEFAULT_HEADERS = {
     "accept", "accept-encoding", "accept-language", "user-agent",
     "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
 }
 
-# Hop-by-Hop-Headers die nicht weitergeleitet werden dürfen
+# Hop-by-hop headers that must not be forwarded
 SKIP_REQUEST_HEADERS = {
     "host", "content-length", "transfer-encoding", "connection", "keep-alive",
 }
@@ -181,7 +181,7 @@ def reset_cookies():
 
 
 def _save_cookies(playwright_cookies):
-    """Browser-Cookies im Netscape-Format für curl-cffi speichern."""
+    """Save browser cookies in Netscape format for curl-cffi."""
     with open(COOKIE_FILE, 'w') as f:
         f.write("# Netscape HTTP Cookie File\n")
         for c in playwright_cookies:
@@ -217,10 +217,10 @@ def _login_camoufox(username, password):
 
 
 def _login_chrome_cdp(username, password):
-    """Login via echtem Google Chrome (CDP) – Fallback wenn Camoufox nicht verfügbar."""
+    """Login via real Google Chrome (CDP) – fallback when Camoufox is not available."""
     chrome = find_chrome()
     if not chrome:
-        raise RuntimeError("Google Chrome nicht gefunden unter " + str(CHROME_PATHS))
+        raise RuntimeError("Google Chrome not found at " + str(CHROME_PATHS))
 
     print(f"  Chrome-CDP: Login als '{username}'...", flush=True)
     user_data_dir = tempfile.mkdtemp(prefix="bbl_chrome_")
@@ -254,8 +254,8 @@ def _login_chrome_cdp(username, password):
             page.fill('input[name="txiID"]', username)
             page.fill('input[name="txiPwd"]', password)
             page.click('input[name="btnLogOn"]')
-            # "load" statt "networkidle" – Akamai-Hintergrundskripte verhindern
-            # sonst, dass networkidle je erreicht wird (→ 30s Timeout → 502)
+            # Use "load" instead of "networkidle" – Akamai background scripts prevent
+            # networkidle from ever being reached (→ 30s timeout → 502)
             page.wait_for_load_state("load", timeout=30000)
             final_url = page.url
             _save_cookies(ctx.cookies())
@@ -276,12 +276,12 @@ def _login_chrome_cdp(username, password):
 
 def browser_login(post_body):
     """
-    Login-Dispatcher: Camoufox headless (bevorzugt) oder Chrome-CDP (Fallback).
-    Gibt (success: bool, error: str|None) zurück.
-    Bei Erfolg: Cookies in COOKIE_FILE gespeichert.
+    Login dispatcher: Camoufox headless (preferred) or Chrome CDP (fallback).
+    Returns (success: bool, error: str|None).
+    On success: cookies saved to COOKIE_FILE.
     """
     if not PLAYWRIGHT_AVAILABLE:
-        return False, "camoufox/playwright nicht installiert"
+        return False, "camoufox/playwright not installed"
 
     params   = urllib.parse.parse_qs(
         post_body.decode('utf-8', errors='replace') if post_body else ""
@@ -290,7 +290,7 @@ def browser_login(post_body):
     password = params.get('txiPwd', [''])[0]
 
     if not username or not password:
-        return False, "Keine Zugangsdaten im POST-Body"
+        return False, "No credentials in POST body"
 
     label = "Camoufox" if USE_CAMOUFOX else "Chrome-CDP"
     try:
@@ -298,19 +298,19 @@ def browser_login(post_body):
                     else _login_chrome_cdp(username, password)
 
         if "signon" in final_url.lower() or "signin" in final_url.lower():
-            print(f"  {label}: Login fehlgeschlagen (url={final_url})", flush=True)
+            print(f"  {label}: Login failed (url={final_url})", flush=True)
             return False, None
 
         print(f"  {label}: Login OK (url={final_url})", flush=True)
         return True, None
 
     except Exception as e:
-        print(f"  {label}: Ausnahme: {e}", flush=True)
+        print(f"  {label}: Exception: {e}", flush=True)
         return False, str(e)
 
 
 def do_request(method, url, extra_headers=None, body=None):
-    """HTTP-Request via curl-cffi (Chrome124-Fingerprint + Session-Cookies)."""
+    """HTTP request via curl-cffi (Chrome124 fingerprint + session cookies)."""
     c = Curl()
     buf_body   = BytesIO()
     buf_header = BytesIO()
@@ -407,7 +407,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle(self, method):
-        # Inaktivitäts-Timer bei jedem Request zurücksetzen
+        # Reset inactivity timer on every request
         if SOCKET_ACTIVATION:
             _reset_idle_timer(self.server)
 
@@ -419,7 +419,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if self.path == "/__reset__":
             reset_cookies()
-            self._reply(200, "text/plain; charset=utf-8", "Cookies zurückgesetzt.")
+            self._reply(200, "text/plain; charset=utf-8", "Cookies reset.")
             return
         if self.path == "/__stop__":
             self._reply(200, "text/plain", "Stopping...")
@@ -432,16 +432,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if n > 0:
                 body = self.rfile.read(n)
 
-        # Browser-Login für POST /SignOn.aspx (Akamai JS-Challenge erfordert echten Browser)
+        # Browser login for POST /SignOn.aspx (Akamai JS challenge requires a real browser)
         if method == "POST" and "/signon" in self.path.lower():
             ok, err = browser_login(body)
             if err:
-                self._reply(502, "text/plain", f"Login Fehler: {err}")
+                self._reply(502, "text/plain", f"Login error: {err}")
                 return
             if not ok:
                 # Falsche Zugangsdaten → SignOn-URL bleibt (→ LoginFailed im Lua)
                 self._reply(200, "text/html",
-                            b"<html><body>Login fehlgeschlagen</body></html>")
+                            b"<html><body>Login failed</body></html>")
                 return
             # Erfolg: redirect zur AccountSummary via Proxy
             loc = f"https://127.0.0.1:{PORT}{SUMMARY_PATH}"

@@ -1,38 +1,38 @@
--- Bangkok Bank (Bualuang iBanking) Web Banking Extension für MoneyMoney
+-- Bangkok Bank (Bualuang iBanking) Web Banking Extension for MoneyMoney
 --
 -- Changelog:
---   2.00  Proxy-Architektur mit curl-cffi (Chrome TLS-Fingerprint, Akamai-Bypass)
---   2.01  Proxy-Auto-Start versucht (os.execute/io.popen – beide im Sandbox geblockt)
---   2.04  Auto-Start entfernt; Proxy läuft als macOS LaunchAgent
+--   2.00  Proxy architecture with curl-cffi (Chrome TLS fingerprint, Akamai bypass)
+--   2.01  Attempted proxy auto-start (os.execute/io.popen – both blocked in sandbox)
+--   2.04  Removed auto-start; proxy runs as a macOS LaunchAgent
 --         ~/Library/LaunchAgents/com.bangkokbank.proxy.plist
---   2.05  Proxy spricht HTTPS (MoneyMoney erzwingt HTTPS für alle Verbindungen)
---   2.06  Proxy v10: Playwright-Login (Akamai JS-Challenge), curl-cffi für Datenabrufe
---   2.07  Fix: tonumber(gsub()) – gsub gibt 2 Werte zurück, base-out-of-range Fehler
---   2.08  Debug-Prints für RefreshAccount (Saldo, Datum-Format, XPath-Treffer)
---   2.09  Fix: ddlAccount-Wert mit korrektem Separator \194\151 (U+0097, char 151)
---   2.10  Fix: navBody-POST gibt bereits Transaktionen zurück; zweiten Search-POST entfernt
---   2.11  Fix: Search-POST korrigiert (DES_Group leer, fehlende Felder, kein radDownload);
---         Fallback auf actPage wenn Search-POST fehlschlägt
---   2.12  MAX_DAYS von 89 auf 365 erhöht für vollständigen Erstimport
---   2.13  Fix: XPath lblLedgerBal → lblLedgerBalVal (Label statt Wert wurde gelesen → nil → Fallback)
---   2.14  Fix: Nil-Check für finalUrl (getBaseURL() kann nil liefern); Debug-Prints entfernt
---   2.15  Proxy v12: Camoufox headless Firefox ersetzt Chrome-CDP (kein Dock-Icon mehr)
---   2.16  Proxy v13: Socket Activation – Proxy läuft nur bei Bedarf, nicht dauerhaft
---   2.17  Code-Bereinigung: redundante Debug-Prints entfernt
+--   2.05  Proxy speaks HTTPS (MoneyMoney enforces HTTPS for all connections)
+--   2.06  Proxy v10: Playwright login (Akamai JS challenge), curl-cffi for data requests
+--   2.07  Fix: tonumber(gsub()) – gsub returns 2 values, causing base-out-of-range error
+--   2.08  Debug prints for RefreshAccount (balance, date format, XPath matches)
+--   2.09  Fix: ddlAccount value with correct separator \194\151 (U+0097, char 151)
+--   2.10  Fix: navBody POST already returns transactions; removed second search POST
+--   2.11  Fix: corrected search POST (DES_Group empty, missing fields, no radDownload);
+--         fall back to actPage if search POST fails
+--   2.12  Increased MAX_DAYS from 89 to 365 for full initial import
+--   2.13  Fix: XPath lblLedgerBal → lblLedgerBalVal (was reading label instead of value → nil → fallback)
+--   2.14  Fix: nil check for finalUrl (getBaseURL() may return nil); removed debug prints
+--   2.15  Proxy v12: Camoufox headless Firefox replaces Chrome CDP (no Dock icon)
+--   2.16  Proxy v13: Socket Activation – proxy only runs on demand, not permanently
+--   2.17  Code cleanup: removed redundant debug prints
 --
--- Abhängigkeit: bangkokbank_proxy.py (v13) via LaunchAgent auf Port 8765
---   Login: Camoufox headless Firefox (Akamai-Bypass, unsichtbar)
---   Start: automatisch durch launchd bei Bedarf (Socket Activation)
+-- Dependency: bangkokbank_proxy.py (v13) via LaunchAgent on port 8765
+--   Login: Camoufox headless Firefox (Akamai bypass, invisible)
+--   Start: automatically by launchd on demand (Socket Activation)
 --   Log:   /tmp/bbl_proxy.log
 
 WebBanking {
   version     = 2.17,
   url         = "https://127.0.0.1:8765",
   services    = {"Bangkok Bank"},
-  description = "Bangkok Bank – Bualuang iBanking (via lokalem Proxy)"
+  description = "Bangkok Bank – Bualuang iBanking (via local proxy)"
 }
 
--- Proxy-Adresse und wichtige Pfade auf dem Bangkok-Bank-Server
+-- Proxy address and key paths on the Bangkok Bank server
 local PROXY        = "https://127.0.0.1:8765"
 local SIGNON       = PROXY .. "/SignOn.aspx"
 local SUMMARY_PATH = "/workspace/16AccountActivity/wsp_AccountSummary_AccountSummaryPage.aspx"
@@ -40,8 +40,8 @@ local ACTIVITY_PATH= "/workspace/16AccountActivity/wsp_AccountActivity_Saving_Cu
 local LOGOUT       = PROXY .. "/LogOut.aspx"
 local MAX_DAYS     = 365  -- maximaler Abrufzeitraum in Tagen
 
-local connection    -- MoneyMoney Connection-Objekt, wird in InitializeSession gesetzt
-local cachedSummary -- AccountSummaryPage nach Login gecacht, spart einen Request in ListAccounts
+local connection    -- MoneyMoney Connection object, set in InitializeSession
+local cachedSummary -- AccountSummaryPage cached after login, saves one request in ListAccounts
 
 local ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
 
@@ -136,14 +136,14 @@ function InitializeSession(protocol, bankCode, username, reserved, password)
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
   connection.language = "en-US,en;q=0.9"
 
-  -- Cookies zurücksetzen
+  -- Reset cookies
   pcall(function() connection:get(PROXY .. "/__reset__") end)
 
   -- SignOn-Seite laden
   local signonContent, signonCharset = doGet("/SignOn.aspx",
     "https://www.bangkokbank.com/")
   if not signonContent or #signonContent < 200 then
-    return "Bangkok Bank Login-Seite konnte nicht geladen werden."
+    return "Bangkok Bank login page could not be loaded."
   end
 
   local loginPage = HTML(signonContent, signonCharset)
@@ -172,14 +172,14 @@ function InitializeSession(protocol, bankCode, username, reserved, password)
     return LoginFailed
   end
 
-  -- Summary cachen
+  -- Cache summary page
   if loginContent and #loginContent > 500 then
     cachedSummary = HTML(loginContent, loginCharset)
-    print("  Summary gecacht (len="..#loginContent..")")
+    print("  Summary cached (len="..#loginContent..")")
   else
     local sc, sch = doGet(SUMMARY_PATH, SIGNON)
     cachedSummary = (sc and #sc > 500) and HTML(sc, sch) or nil
-    print("  Summary ".. (cachedSummary and "geladen" or "FEHLER"))
+    print("  Summary ".. (cachedSummary and "loaded" or "ERROR"))
   end
 
   print("  -> OK")
@@ -191,10 +191,10 @@ function ListAccounts(knownAccounts)
   local summaryPage = cachedSummary
   if not summaryPage then
     local sc, sch = doGet(SUMMARY_PATH, SIGNON)
-    if not sc or #sc < 200 then return "Kontenübersicht nicht erreichbar." end
+    if not sc or #sc < 200 then return "Account summary page not reachable." end
     summaryPage = HTML(sc, sch)
   else
-    print("  Verwende gecachte Summary")
+    print("  Using cached summary")
   end
 
   local accounts = {}
@@ -217,7 +217,7 @@ function ListAccounts(knownAccounts)
     elseif tl:find("loan")    then accType = AccountTypeLoan
     elseif tl:find("fixed")   then accType = AccountTypeFixedTermDeposit
     end
-    print("  Konto: "..accNo.." ("..typeName..")")
+    print("  Account: "..accNo.." ("..typeName..")")
     accounts[#accounts+1] = {
       name=((typeName~="" and typeName or "Account").." "..accNo),
       accountNumber=accNo, bankCode="BKKBTHBK", currency="THB",
@@ -227,10 +227,10 @@ function ListAccounts(knownAccounts)
 
   if #accounts == 0 then
     local txt = summaryPage:xpath("//body"):text() or ""
-    print("  Keine Konten! Seite: "..txt:sub(1,200))
-    return "Keine Konten gefunden."
+    print("  No accounts found! Page: "..txt:sub(1,200))
+    return "No accounts found."
   end
-  print("  "..#accounts.." Konto/Konten")
+  print("  "..#accounts.." account(s)")
   return accounts
 end
 
@@ -242,7 +242,7 @@ function RefreshAccount(account, since)
   end
 
   local sc, sch = doGet(SUMMARY_PATH, SIGNON)
-  if not sc or #sc<200 then return "Summary nicht erreichbar." end
+  if not sc or #sc<200 then return "Summary page not reachable." end
   local sumPage = HTML(sc, sch)
   local sumTok  = tokens(sumPage)
 
@@ -258,7 +258,7 @@ function RefreshAccount(account, since)
   })
 
   local ac, ach = doPost(ACTIVITY_PATH, navBody, PROXY..SUMMARY_PATH)
-  if not ac or #ac<200 then return "Activity-Seite nicht erreichbar." end
+  if not ac or #ac<200 then return "Activity page not reachable." end
   local actPage = HTML(ac, ach)
   local balRaw = actPage:xpath("//*[contains(@id,'lblLedgerBalVal')]"):text()
   print("  balRaw='" .. tostring(balRaw) .. "'")
@@ -267,10 +267,10 @@ function RefreshAccount(account, since)
   local now    = os.time()
   local fromTs = since and math.max(since, now-MAX_DAYS*86400) or (now-MAX_DAYS*86400)
 
-  -- Search-POST mit gewünschtem Datumsbereich versuchen.
-  -- Korrekte Felder laut HTML-Formular: DES_Group="", kein radDownloadTextFormat,
-  -- AcctID/AcctIndex/Be1stCardIndex/flagPost leer, SEP-Zeichen im ddlAccount-Wert.
-  local resPage = actPage  -- Fallback: actPage (Server-Standard ~28 Tage)
+  -- Attempt a search POST with the desired date range.
+  -- Correct fields per HTML form: DES_Group="", no radDownloadTextFormat,
+  -- AcctID/AcctIndex/Be1stCardIndex/flagPost empty, SEP char in ddlAccount value.
+  local resPage = actPage  -- Fallback: actPage (server default ~28 days)
   local actTok = tokens(actPage)
   local SEP = "\194\151"
   local ddlVal = acctIndex..SEP..acctId..SEP.."001"..SEP.."wsp_AccountActivity_Saving_Current.aspx"
@@ -304,10 +304,10 @@ function RefreshAccount(account, since)
       balance = rb
       print("  Search-POST OK ("..dmy(fromTs).." – "..dmy(now)..")")
     else
-      print("  Search-POST fehlgeschlagen, verwende actPage (Standard-Datumsbereich)")
+      print("  Search POST failed, falling back to actPage (default date range)")
     end
   else
-    print("  Search-POST fehlgeschlagen, verwende actPage (Standard-Datumsbereich)")
+    print("  Search POST failed, falling back to actPage (default date range)")
   end
 
   local transactions = {}
@@ -342,7 +342,7 @@ function RefreshAccount(account, since)
   end)
 
   table.sort(transactions,function(a,b) return a.bookingDate>b.bookingDate end)
-  print("  txNodes="..txCount.." Saldo="..tostring(balance).." Umsätze="..#transactions)
+  print("  txNodes="..txCount.." balance="..tostring(balance).." transactions="..#transactions)
   return {balance=balance or 0, transactions=transactions}
 end
 
