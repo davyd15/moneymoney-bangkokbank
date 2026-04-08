@@ -139,7 +139,7 @@ function InitializeSession(protocol, bankCode, username, reserved, password)
   -- Reset cookies
   pcall(function() connection:get(PROXY .. "/__reset__") end)
 
-  -- SignOn-Seite laden
+  -- Load sign-on page
   local signonContent, signonCharset = doGet("/SignOn.aspx",
     "https://www.bangkokbank.com/")
   if not signonContent or #signonContent < 200 then
@@ -149,7 +149,7 @@ function InitializeSession(protocol, bankCode, username, reserved, password)
   local loginPage = HTML(signonContent, signonCharset)
   local tok = tokens(loginPage)
   if tok["__VIEWSTATE"] == "" then
-    return "VIEWSTATE nicht gefunden – bitte erneut versuchen."
+    return "VIEWSTATE not found – please try again."
   end
 
   -- Login POST
