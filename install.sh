@@ -24,13 +24,14 @@ echo "────────────────────────�
 step "Finding Python 3..."
 
 PYTHON=""
-for candidate in \
-    "$(brew --prefix python 2>/dev/null)/bin/python3" \
-    /opt/homebrew/bin/python3 \
-    /opt/homebrew/opt/python3/bin/python3 \
-    /usr/local/bin/python3 \
-    /usr/bin/python3; do
-    if [ -x "$candidate" ] 2>/dev/null; then
+CANDIDATES=(/opt/homebrew/bin/python3 /opt/homebrew/opt/python3/bin/python3 /usr/local/bin/python3 /usr/bin/python3)
+# Prepend Homebrew-managed Python if brew is available
+if command -v brew &>/dev/null; then
+    BREW_PY="$(brew --prefix python 2>/dev/null)/bin/python3"
+    CANDIDATES=("$BREW_PY" "${CANDIDATES[@]}")
+fi
+for candidate in "${CANDIDATES[@]}"; do
+    if [ -x "$candidate" ]; then
         PYTHON="$candidate"
         break
     fi

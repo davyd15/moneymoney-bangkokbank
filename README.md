@@ -1,5 +1,10 @@
 # MoneyMoney Extension – Bangkok Bank
 
+![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Version](https://img.shields.io/badge/version-2.17-green)
+![Language](https://img.shields.io/badge/language-Lua%20%2B%20Python-yellow)
+
 A [MoneyMoney](https://moneymoney-app.com) extension for **Bangkok Bank (BBL) Thailand** via the [Bualuang iBanking](https://ibanking.bangkokbank.com) web portal. Fetches account balances and transactions.
 
 ---
@@ -89,8 +94,9 @@ On the first refresh, the proxy creates a self-signed certificate for `127.0.0.1
   ```
 
 **Camoufox download fails**
-- Run manually: `python3 -m camoufox fetch`
-- Alternatively, install Google Chrome — the proxy will fall back to Chrome CDP
+- Run manually: `python3 -m camoufox fetch` (use the same Python the installer used)
+- Check the log for details: `cat /tmp/bbl_proxy.log`
+- Alternatively, install Google Chrome — the proxy will fall back to Chrome CDP automatically
 
 **Extension not appearing in MoneyMoney**
 - Confirm `BangkokBank.lua` is in:
@@ -109,10 +115,12 @@ Removes the extension, LaunchAgent, Keychain certificate, and temp files.
 
 | Version | Changes |
 |---------|---------|
-| 2.17 | Code cleanup |
-| 2.16 | Socket Activation – proxy starts on demand, shuts down after idle |
-| 2.15 | Camoufox headless Firefox replaces Chrome CDP (no Dock icon) |
-| 2.00 | Initial release – proxy architecture with Akamai bypass |
+| 2.17 | Code cleanup, redundant debug output removed |
+| 2.16 | Socket Activation: proxy starts on demand via launchd, 120s idle shutdown |
+| 2.15 | Camoufox headless Firefox replaces Chrome CDP – login is now fully invisible |
+| 2.09–2.14 | Transaction parsing fixes, nil-checks, XPath corrections |
+| 2.05–2.08 | HTTPS proxy (required by MoneyMoney), LaunchAgent integration |
+| 2.00 | Initial release – local proxy architecture to bypass Akamai Bot Manager |
 
 ## Contributing
 
