@@ -1,39 +1,178 @@
 #!/usr/bin/env python3
 """
-Bangkok Bank iBanking Proxy für MoneyMoney  –  v6
+Bangkok Bank iBanking Proxy für MoneyMoney  –  v13
 ==================================================
-Verwendet curl-cffi's Low-Level Curl-API mit explizitem HTTP/1.1
-und Chrome-TLS-Fingerprint um Akamai zu umgehen.
+Hybrid-Architektur:
+- Login  (POST /SignOn.aspx):  Camoufox headless Firefox (Akamai-JS-Challenge)
+                               Fallback: echtes Google Chrome via CDP
+- Danach (alle weiteren Req.): curl-cffi Chrome124-Impersonation mit Session-Cookies
+
+Socket Activation (Normalbetrieb als LaunchAgent):
+  launchd hält Port 8765 dauerhaft. Der Proxy startet nur wenn MoneyMoney
+  eine Verbindung aufbaut und fährt nach 120s Inaktivität automatisch herunter.
+  launchd startet ihn beim nächsten Abruf wieder.
 
 Einmalige Installation:
-    pip3 install curl-cffi
+    pip3 install curl-cffi camoufox --break-system-packages
+    python3 -m camoufox fetch
 
-Start:
+Fallback (wenn kein Camoufox):
+    pip3 install playwright --break-system-packages
+    Google Chrome muss installiert sein: /Applications/Google Chrome.app/
+
+Manueller Start (für Tests):
     python3 bangkokbank_proxy.py
-Stop:
-    CTRL+C
 """
 
-import sys
+# Dock-Icon sofort unterdrücken – vor allen anderen Imports damit kein Flash entsteht
+try:
+    import AppKit
+    AppKit.NSApplication.sharedApplication().setActivationPolicy_(
+        AppKit.NSApplicationActivationPolicyProhibited)
+except Exception:
+    pass
+
+import sys, ssl, shutil, ctypes, socket as _socket
+import subprocess, urllib.parse, urllib.request, time
 
 try:
-    import curl_cffi
-    from curl_cffi import Curl, CurlOpt
-    from curl_cffi import CurlHttpVersion
-    print(f"curl-cffi Version: {curl_cffi.__version__}", flush=True)
+    from curl_cffi import Curl, CurlOpt, CurlHttpVersion, CurlInfo
 except ImportError:
-    print("FEHLER: pip3 install curl-cffi")
+    print("FEHLER: curl-cffi fehlt – bitte installieren:", flush=True)
+    print("  pip3 install curl-cffi --break-system-packages", flush=True)
     sys.exit(1)
 
-import http.server, threading, json
+try:
+    from camoufox.sync_api import Camoufox as _Camoufox
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+    USE_CAMOUFOX = True
+    print("Camoufox verfügbar – verwende headless Firefox für Login.", flush=True)
+except ImportError:
+    try:
+        from playwright.sync_api import sync_playwright
+        PLAYWRIGHT_AVAILABLE = True
+        USE_CAMOUFOX = False
+        print("Camoufox nicht gefunden – Fallback auf Chrome-CDP.", flush=True)
+    except ImportError:
+        PLAYWRIGHT_AVAILABLE = False
+        USE_CAMOUFOX = False
+        print("WARNUNG: weder camoufox noch playwright installiert – Login wird fehlschlagen.", flush=True)
+        print("  pip3 install camoufox --break-system-packages && python3 -m camoufox fetch", flush=True)
+
+import http.server, socketserver, threading, json, os, tempfile, gzip, zlib
 from io import BytesIO
 
-PORT   = 8765
-TARGET = "https://ibanking.bangkokbank.com"
+PORT         = 8765
+CDP_PORT     = 9223   # Nur für Chrome-CDP-Fallback
+IDLE_TIMEOUT = 120    # Sekunden Inaktivität bis zum automatischen Herunterfahren
 
-# Cookie-Datei für Session-Persistenz zwischen Requests
-import tempfile, os
-COOKIE_FILE = os.path.join(tempfile.gettempdir(), "bbl_session.txt")
+TARGET       = "https://ibanking.bangkokbank.com"
+SUMMARY_PATH = "/workspace/16AccountActivity/wsp_AccountSummary_AccountSummaryPage.aspx"
+CERT_FILE    = os.path.join(tempfile.gettempdir(), "bbl_cert.pem")
+KEY_FILE     = os.path.join(tempfile.gettempdir(), "bbl_key.pem")
+COOKIE_FILE  = os.path.join(tempfile.gettempdir(), "bbl_session.txt")
+
+CHROME_PATHS = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+]
+
+SOCKET_ACTIVATION = False  # Wird in main() gesetzt
+_idle_timer       = None
+_idle_lock        = threading.Lock()
+
+
+def find_chrome():
+    for p in CHROME_PATHS:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _get_launchd_socket():
+    """Übernimmt den von launchd vorab gebundenen Socket (Socket Activation)."""
+    try:
+        lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
+        fds  = ctypes.POINTER(ctypes.c_int)()
+        cnt  = ctypes.c_size_t(0)
+        ret  = lib.launch_activate_socket(
+            b'Listeners', ctypes.byref(fds), ctypes.byref(cnt))
+        if ret != 0 or cnt.value == 0:
+            return None
+        sock = _socket.socket(fileno=fds[0])
+        lib.free(fds)
+        return sock
+    except Exception:
+        return None
+
+
+def _reset_idle_timer(server):
+    """Setzt Inaktivitäts-Timer zurück. Nach IDLE_TIMEOUT Sekunden ohne Request fährt
+    der Proxy herunter; launchd startet ihn beim nächsten Abruf wieder."""
+    global _idle_timer
+    with _idle_lock:
+        if _idle_timer:
+            _idle_timer.cancel()
+        _idle_timer = threading.Timer(
+            IDLE_TIMEOUT,
+            lambda: threading.Thread(target=server.shutdown, daemon=True).start()
+        )
+        _idle_timer.daemon = True
+        _idle_timer.start()
+
+
+class _PreBoundHTTPServer(http.server.HTTPServer):
+    """HTTPServer der einen bereits gebundenen launchd-Socket verwendet
+    (überspringt bind/listen da launchd das bereits erledigt hat)."""
+    def __init__(self, sock, handler):
+        socketserver.BaseServer.__init__(self, sock.getsockname(), handler)
+        self.socket = sock
+
+
+def ensure_tls_cert():
+    """Selbst-signiertes Zertifikat für localhost erstellen (einmalig)."""
+    if os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE):
+        return
+    print("Erstelle selbst-signiertes TLS-Zertifikat für localhost...", flush=True)
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+        "-keyout", KEY_FILE, "-out", CERT_FILE,
+        "-days", "3650", "-nodes",
+        "-subj", "/CN=127.0.0.1",
+        "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost",
+    ], check=True, capture_output=True)
+    print(f"Zertifikat erstellt: {CERT_FILE}", flush=True)
+    keychain = os.path.expanduser("~/Library/Keychains/login.keychain-db")
+    try:
+        subprocess.run([
+            "security", "add-trusted-cert", "-r", "trustRoot",
+            "-k", keychain, CERT_FILE,
+        ], check=True)
+        print("Zertifikat dem Keychain hinzugefügt.", flush=True)
+    except subprocess.CalledProcessError:
+        print(f"\n⚠️  Bitte Zertifikat einmalig manuell vertrauen:\n"
+              f"  security add-trusted-cert -r trustRoot -k {keychain} {CERT_FILE}\n",
+              flush=True)
+
+
+# Von Chrome-Impersonation automatisch gesetzte Headers – nicht aus dem Lua-Request übernehmen,
+# da curl-cffi diese als Teil des Fingerprints selbst setzt.
+CHROME_DEFAULT_HEADERS = {
+    "accept", "accept-encoding", "accept-language", "user-agent",
+    "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+}
+
+# Hop-by-Hop-Headers die nicht weitergeleitet werden dürfen
+SKIP_REQUEST_HEADERS = {
+    "host", "content-length", "transfer-encoding", "connection", "keep-alive",
+}
+
+# Transfer-Encoding und Content-Length werden nach Dekomprimierung neu gesetzt
+SKIP_RESPONSE_HEADERS = {
+    "transfer-encoding", "connection", "keep-alive", "content-encoding",
+    "content-length",
+}
 
 
 def reset_cookies():
@@ -41,61 +180,164 @@ def reset_cookies():
         os.remove(COOKIE_FILE)
 
 
+def _save_cookies(playwright_cookies):
+    """Browser-Cookies im Netscape-Format für curl-cffi speichern."""
+    with open(COOKIE_FILE, 'w') as f:
+        f.write("# Netscape HTTP Cookie File\n")
+        for c in playwright_cookies:
+            domain  = c.get('domain', '')
+            include_subdomain = "TRUE" if domain.startswith('.') else "FALSE"
+            if not domain.startswith('.'):
+                domain = '.' + domain
+            path    = c.get('path', '/')
+            secure  = "TRUE" if c.get('secure', False) else "FALSE"
+            expires = int(c.get('expires', 0))
+            if expires < 0:
+                expires = 2147483647
+            name    = c.get('name', '')
+            value   = c.get('value', '')
+            prefix  = "#HttpOnly_" if c.get('httpOnly', False) else ""
+            f.write(f"{prefix}{domain}\t{include_subdomain}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
+    print(f"  {len(playwright_cookies)} Cookies gespeichert", flush=True)
+
+
+def _login_camoufox(username, password):
+    """Login via Camoufox headless Firefox – kein sichtbares Fenster."""
+    print(f"  Camoufox: Login als '{username}'...", flush=True)
+    with _Camoufox(headless=True) as browser:
+        page = browser.new_page()
+        page.goto(TARGET + "/SignOn.aspx", wait_until="load", timeout=30000)
+        page.fill('input[name="txiID"]', username)
+        page.fill('input[name="txiPwd"]', password)
+        page.click('input[name="btnLogOn"]')
+        page.wait_for_load_state("load", timeout=30000)
+        final_url = page.url
+        _save_cookies(page.context.cookies())
+    return final_url
+
+
+def _login_chrome_cdp(username, password):
+    """Login via echtem Google Chrome (CDP) – Fallback wenn Camoufox nicht verfügbar."""
+    chrome = find_chrome()
+    if not chrome:
+        raise RuntimeError("Google Chrome nicht gefunden unter " + str(CHROME_PATHS))
+
+    print(f"  Chrome-CDP: Login als '{username}'...", flush=True)
+    user_data_dir = tempfile.mkdtemp(prefix="bbl_chrome_")
+    proc = None
+    try:
+        proc = subprocess.Popen([
+            chrome,
+            f"--remote-debugging-port={CDP_PORT}",
+            f"--user-data-dir={user_data_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-default-apps",
+            "--disable-extensions",
+            "--disable-background-networking",
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        for _ in range(20):
+            time.sleep(0.5)
+            try:
+                urllib.request.urlopen(f"http://localhost:{CDP_PORT}/json/version", timeout=1)
+                break
+            except Exception:
+                pass
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(
+                f"http://localhost:{CDP_PORT}", timeout=15000)
+            ctx  = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = ctx.pages[0]        if ctx.pages        else ctx.new_page()
+            page.goto(TARGET + "/SignOn.aspx", wait_until="load", timeout=30000)
+            page.fill('input[name="txiID"]', username)
+            page.fill('input[name="txiPwd"]', password)
+            page.click('input[name="btnLogOn"]')
+            # "load" statt "networkidle" – Akamai-Hintergrundskripte verhindern
+            # sonst, dass networkidle je erreicht wird (→ 30s Timeout → 502)
+            page.wait_for_load_state("load", timeout=30000)
+            final_url = page.url
+            _save_cookies(ctx.cookies())
+            try:
+                browser.close()
+            except Exception:
+                pass
+        return final_url
+    finally:
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        shutil.rmtree(user_data_dir, ignore_errors=True)
+
+
+def browser_login(post_body):
+    """
+    Login-Dispatcher: Camoufox headless (bevorzugt) oder Chrome-CDP (Fallback).
+    Gibt (success: bool, error: str|None) zurück.
+    Bei Erfolg: Cookies in COOKIE_FILE gespeichert.
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        return False, "camoufox/playwright nicht installiert"
+
+    params   = urllib.parse.parse_qs(
+        post_body.decode('utf-8', errors='replace') if post_body else ""
+    )
+    username = params.get('txiID', [''])[0]
+    password = params.get('txiPwd', [''])[0]
+
+    if not username or not password:
+        return False, "Keine Zugangsdaten im POST-Body"
+
+    label = "Camoufox" if USE_CAMOUFOX else "Chrome-CDP"
+    try:
+        final_url = _login_camoufox(username, password) if USE_CAMOUFOX \
+                    else _login_chrome_cdp(username, password)
+
+        if "signon" in final_url.lower() or "signin" in final_url.lower():
+            print(f"  {label}: Login fehlgeschlagen (url={final_url})", flush=True)
+            return False, None
+
+        print(f"  {label}: Login OK (url={final_url})", flush=True)
+        return True, None
+
+    except Exception as e:
+        print(f"  {label}: Ausnahme: {e}", flush=True)
+        return False, str(e)
+
+
 def do_request(method, url, extra_headers=None, body=None):
-    """
-    Führt einen HTTP-Request via curl-cffi Low-Level API aus.
-    - impersonate("chrome124")  → Chrome TLS/JA3-Fingerprint
-    - CURLOPT_HTTP_VERSION = CURL_HTTP_VERSION_1_1 → kein HTTP/2
-    - CURLOPT_COOKIEFILE / CURLOPT_COOKIEJAR → persistente Cookies
-    """
+    """HTTP-Request via curl-cffi (Chrome124-Fingerprint + Session-Cookies)."""
     c = Curl()
     buf_body   = BytesIO()
     buf_header = BytesIO()
 
-    # TLS-Fingerprint: Chrome124
-    c.impersonate("chrome124", default_headers=False)
-
-    # HTTP/1.1 erzwingen (CURLOPT_HTTP_VERSION = 84, CURL_HTTP_VERSION_1_1 = 2)
+    c.impersonate("chrome124")
     c.setopt(CurlOpt.HTTP_VERSION, CurlHttpVersion.V1_1)
-
-    # Cookie-Persistenz
     c.setopt(CurlOpt.COOKIEFILE, COOKIE_FILE.encode())
     c.setopt(CurlOpt.COOKIEJAR,  COOKIE_FILE.encode())
-
-    # Redirects folgen
     c.setopt(CurlOpt.FOLLOWLOCATION, 1)
     c.setopt(CurlOpt.MAXREDIRS, 5)
-
-    # Timeout
     c.setopt(CurlOpt.CONNECTTIMEOUT, 15)
     c.setopt(CurlOpt.TIMEOUT, 30)
-
-    # URL
     c.setopt(CurlOpt.URL, url.encode())
 
-    # Headers zusammenbauen
-    headers = [
-        b"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        b"Accept-Language: en-US,en;q=0.9",
-        b"Cache-Control: no-cache",
-        b"Pragma: no-cache",
-        b"Upgrade-Insecure-Requests: 1",
-        f"User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36".encode(),
-    ]
-    # Zusätzliche Headers (Referer, Origin, Content-Type etc.)
+    extra = []
     if extra_headers:
-        skip = {"host","content-length","transfer-encoding","connection",
-                "keep-alive","user-agent","accept","accept-language",
-                "accept-encoding","cache-control","pragma"}
         for k, v in extra_headers.items():
-            if k.lower() not in skip:
-                # localhost-Referenzen korrigieren
-                if k.lower() in ("referer","origin") and "127.0.0.1" in v:
-                    v = v.replace(f"http://127.0.0.1:{PORT}", TARGET)
-                headers.append(f"{k}: {v}".encode())
-    c.setopt(CurlOpt.HTTPHEADER, headers)
+            kl = k.lower()
+            if kl in SKIP_REQUEST_HEADERS or kl in CHROME_DEFAULT_HEADERS:
+                continue
+            if kl in ("referer", "origin") and "127.0.0.1" in v:
+                v = v.replace(f"https://127.0.0.1:{PORT}", TARGET)
+                v = v.replace(f"http://127.0.0.1:{PORT}", TARGET)
+            extra.append(f"{k}: {v}".encode())
+    if extra:
+        c.setopt(CurlOpt.HTTPHEADER, extra)
 
-    # POST-Body
     if method == "POST" and body:
         if isinstance(body, str):
             body = body.encode()
@@ -103,27 +345,40 @@ def do_request(method, url, extra_headers=None, body=None):
         c.setopt(CurlOpt.POSTFIELDS, body)
         c.setopt(CurlOpt.POSTFIELDSIZE, len(body))
 
-    # Response-Body und Headers abfangen
     c.setopt(CurlOpt.WRITEFUNCTION,  lambda d: buf_body.write(d))
     c.setopt(CurlOpt.HEADERFUNCTION, lambda d: buf_header.write(d))
 
     c.perform()
 
-    status = c.getinfo(CurlOpt.RESPONSE_CODE)   # type: ignore
+    status = c.getinfo(CurlInfo.RESPONSE_CODE)
     c.close()
 
-    # Header parsen
-    raw_headers = buf_header.getvalue().decode("utf-8", errors="replace")
+    raw = buf_header.getvalue().decode("utf-8", errors="replace")
     resp_headers = {}
-    # Bei Redirects: letzten Header-Block nehmen
-    blocks = [b for b in raw_headers.split("\r\n\r\n") if b.strip()]
+    blocks = [b for b in raw.split("\r\n\r\n") if b.strip()]
     if blocks:
         for line in blocks[-1].split("\r\n")[1:]:
             if ":" in line:
                 k, _, v = line.partition(":")
                 resp_headers[k.strip().lower()] = v.strip()
 
-    return int(status), resp_headers, buf_body.getvalue()
+    body_bytes = buf_body.getvalue()
+
+    ce = resp_headers.get("content-encoding", "").lower()
+    if "gzip" in ce:
+        try:
+            body_bytes = gzip.decompress(body_bytes)
+            del resp_headers["content-encoding"]
+        except Exception as e:
+            print(f"  gzip decompress failed: {e}", flush=True)
+    elif "deflate" in ce:
+        try:
+            body_bytes = zlib.decompress(body_bytes)
+            del resp_headers["content-encoding"]
+        except Exception as e:
+            print(f"  deflate decompress failed: {e}", flush=True)
+
+    return int(status), resp_headers, body_bytes
 
 
 def forward_request(method, path, in_headers, body=None):
@@ -143,7 +398,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         print(f"  [{self.command:4}] {self.path[:65]:<65} → {st}", flush=True)
 
     def _reply(self, status, ctype, body):
-        if isinstance(body, str): body = body.encode()
+        if isinstance(body, str):
+            body = body.encode()
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -151,13 +407,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle(self, method):
+        # Inaktivitäts-Timer bei jedem Request zurücksetzen
+        if SOCKET_ACTIVATION:
+            _reset_idle_timer(self.server)
+
         if self.path == "/__status__":
+            mode = "socket-activation" if SOCKET_ACTIVATION else "manual"
             self._reply(200, "application/json",
-                json.dumps({"status": "running", "target": TARGET}))
+                json.dumps({"status": "running", "target": TARGET,
+                            "version": 13, "mode": mode}))
             return
         if self.path == "/__reset__":
             reset_cookies()
-            self._reply(200, "text/plain", "Cookies zurückgesetzt.")
+            self._reply(200, "text/plain; charset=utf-8", "Cookies zurückgesetzt.")
             return
         if self.path == "/__stop__":
             self._reply(200, "text/plain", "Stopping...")
@@ -167,17 +429,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = None
         if method == "POST":
             n = int(self.headers.get("Content-Length", 0))
-            if n > 0: body = self.rfile.read(n)
+            if n > 0:
+                body = self.rfile.read(n)
+
+        # Browser-Login für POST /SignOn.aspx (Akamai JS-Challenge erfordert echten Browser)
+        if method == "POST" and "/signon" in self.path.lower():
+            ok, err = browser_login(body)
+            if err:
+                self._reply(502, "text/plain", f"Login Fehler: {err}")
+                return
+            if not ok:
+                # Falsche Zugangsdaten → SignOn-URL bleibt (→ LoginFailed im Lua)
+                self._reply(200, "text/html",
+                            b"<html><body>Login fehlgeschlagen</body></html>")
+                return
+            # Erfolg: redirect zur AccountSummary via Proxy
+            loc = f"https://127.0.0.1:{PORT}{SUMMARY_PATH}"
+            self.send_response(302)
+            self.send_header("Location", loc)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
 
         status, resp_h, body_bytes = forward_request(
             method, self.path, dict(self.headers), body)
 
         self.send_response(status)
-        skip_r = {"transfer-encoding","connection","keep-alive","content-encoding"}
         for k, v in resp_h.items():
-            if k.lower() not in skip_r:
-                try: self.send_header(k, v)
-                except: pass
+            if k.lower() not in SKIP_RESPONSE_HEADERS:
+                try:
+                    self.send_header(k, v)
+                except Exception:
+                    pass
         self.send_header("Content-Length", str(len(body_bytes)))
         self.end_headers()
         self.wfile.write(body_bytes)
@@ -188,14 +471,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    reset_cookies()  # frische Session beim Start
-    print(f"\nBangkok Bank Proxy v6 (Low-Level Curl API)")
-    print(f"Lauscht auf:  http://127.0.0.1:{PORT}/")
-    print(f"Ziel:         {TARGET}")
-    print( "Beenden:      CTRL+C\n")
+    ensure_tls_cert()
+    reset_cookies()
+
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(CERT_FILE, KEY_FILE)
+
+    launchd_sock = _get_launchd_socket()
+    if launchd_sock:
+        SOCKET_ACTIVATION = True
+        ssl_sock = tls.wrap_socket(launchd_sock, server_side=True)
+        srv = _PreBoundHTTPServer(ssl_sock, Handler)
+        mode_info = f"Socket Activation, Idle-Shutdown nach {IDLE_TIMEOUT}s"
+        _reset_idle_timer(srv)  # Initialen Timer starten
+    else:
+        srv = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
+        srv.socket = tls.wrap_socket(srv.socket, server_side=True)
+        mode_info = "Manueller Start"
+
+    login_method = "Camoufox headless" if USE_CAMOUFOX else "Chrome-CDP"
+    print(f"\nBangkok Bank Proxy v13  –  {mode_info}", flush=True)
+    print(f"  Login:   {login_method} + curl-cffi chrome124", flush=True)
+    print(f"  Proxy:   https://127.0.0.1:{PORT}/  →  {TARGET}", flush=True)
+    if not SOCKET_ACTIVATION:
+        print("  Beenden: CTRL+C", flush=True)
+    print()
     sys.stdout.flush()
-    srv = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nProxy beendet.")
+    print("Proxy heruntergefahren.", flush=True)

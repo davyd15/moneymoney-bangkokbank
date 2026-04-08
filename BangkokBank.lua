@@ -1,29 +1,54 @@
 -- Bangkok Bank (Bualuang iBanking) Web Banking Extension für MoneyMoney
--- Version: 2.00  –  benötigt bangkokbank_proxy.py auf localhost:8765
+--
+-- Changelog:
+--   2.00  Proxy-Architektur mit curl-cffi (Chrome TLS-Fingerprint, Akamai-Bypass)
+--   2.01  Proxy-Auto-Start versucht (os.execute/io.popen – beide im Sandbox geblockt)
+--   2.04  Auto-Start entfernt; Proxy läuft als macOS LaunchAgent
+--         ~/Library/LaunchAgents/com.bangkokbank.proxy.plist
+--   2.05  Proxy spricht HTTPS (MoneyMoney erzwingt HTTPS für alle Verbindungen)
+--   2.06  Proxy v10: Playwright-Login (Akamai JS-Challenge), curl-cffi für Datenabrufe
+--   2.07  Fix: tonumber(gsub()) – gsub gibt 2 Werte zurück, base-out-of-range Fehler
+--   2.08  Debug-Prints für RefreshAccount (Saldo, Datum-Format, XPath-Treffer)
+--   2.09  Fix: ddlAccount-Wert mit korrektem Separator \194\151 (U+0097, char 151)
+--   2.10  Fix: navBody-POST gibt bereits Transaktionen zurück; zweiten Search-POST entfernt
+--   2.11  Fix: Search-POST korrigiert (DES_Group leer, fehlende Felder, kein radDownload);
+--         Fallback auf actPage wenn Search-POST fehlschlägt
+--   2.12  MAX_DAYS von 89 auf 365 erhöht für vollständigen Erstimport
+--   2.13  Fix: XPath lblLedgerBal → lblLedgerBalVal (Label statt Wert wurde gelesen → nil → Fallback)
+--   2.14  Fix: Nil-Check für finalUrl (getBaseURL() kann nil liefern); Debug-Prints entfernt
+--   2.15  Proxy v12: Camoufox headless Firefox ersetzt Chrome-CDP (kein Dock-Icon mehr)
+--   2.16  Proxy v13: Socket Activation – Proxy läuft nur bei Bedarf, nicht dauerhaft
+--   2.17  Code-Bereinigung: redundante Debug-Prints entfernt
+--
+-- Abhängigkeit: bangkokbank_proxy.py (v13) via LaunchAgent auf Port 8765
+--   Login: Camoufox headless Firefox (Akamai-Bypass, unsichtbar)
+--   Start: automatisch durch launchd bei Bedarf (Socket Activation)
+--   Log:   /tmp/bbl_proxy.log
 
 WebBanking {
-  version     = 2.00,
-  url         = "http://127.0.0.1:8765",
+  version     = 2.17,
+  url         = "https://127.0.0.1:8765",
   services    = {"Bangkok Bank"},
   description = "Bangkok Bank – Bualuang iBanking (via lokalem Proxy)"
 }
 
-local PROXY        = "http://127.0.0.1:8765"
+-- Proxy-Adresse und wichtige Pfade auf dem Bangkok-Bank-Server
+local PROXY        = "https://127.0.0.1:8765"
 local SIGNON       = PROXY .. "/SignOn.aspx"
 local SUMMARY_PATH = "/workspace/16AccountActivity/wsp_AccountSummary_AccountSummaryPage.aspx"
 local ACTIVITY_PATH= "/workspace/16AccountActivity/wsp_AccountActivity_Saving_Current.aspx"
 local LOGOUT       = PROXY .. "/LogOut.aspx"
-local MAX_DAYS     = 89
+local MAX_DAYS     = 365  -- maximaler Abrufzeitraum in Tagen
 
-local connection
-local cachedSummary
+local connection    -- MoneyMoney Connection-Objekt, wird in InitializeSession gesetzt
+local cachedSummary -- AccountSummaryPage nach Login gecacht, spart einen Request in ListAccounts
 
 local ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
 
 local function doGet(path, referer)
   local url = PROXY .. path
   print("GET " .. url)
-  local content, charset = connection:request("GET", url, nil, nil, {
+  return connection:request("GET", url, nil, nil, {
     ["Accept"]                    = ACCEPT,
     ["Accept-Language"]           = "en-US,en;q=0.9",
     ["Cache-Control"]             = "no-cache",
@@ -31,14 +56,12 @@ local function doGet(path, referer)
     ["Upgrade-Insecure-Requests"] = "1",
     ["Referer"]                   = referer or PROXY,
   })
-  print("  len=" .. tostring(content and #content or 0))
-  return content, charset
 end
 
 local function doPost(path, body, referer)
   local url = PROXY .. path
   print("POST " .. url)
-  local content, charset = connection:request("POST", url, body,
+  return connection:request("POST", url, body,
     "application/x-www-form-urlencoded", {
       ["Accept"]                    = ACCEPT,
       ["Accept-Language"]           = "en-US,en;q=0.9",
@@ -48,8 +71,6 @@ local function doPost(path, body, referer)
       ["Upgrade-Insecure-Requests"] = "1",
       ["Referer"]                   = referer or SIGNON,
     })
-  print("  len=" .. tostring(content and #content or 0))
-  return content, charset
 end
 
 local function enc(s)
@@ -73,13 +94,12 @@ local function tokens(html)
   for _, n in ipairs(names) do
     t[n] = html:xpath("//input[@name='"..n.."']"):attr("value") or ""
   end
-  print("  VIEWSTATE="..#t["__VIEWSTATE"].." EVENTVAL="..#t["__EVENTVALIDATION"])
   return t
 end
 
 local function amt(s)
   if not s or s=="" then return nil end
-  return tonumber(s:gsub(",",""))
+  return tonumber((s:gsub(",","")))
 end
 
 local MON  = {Jan=1,Feb=2,Mar=3,Apr=4,May=5,Jun=6,
@@ -103,6 +123,7 @@ local function dmy(ts)
 end
 
 -- ============================================================
+-- MoneyMoney API Entry Points
 
 function SupportsBank(protocol, bankCode)
   return protocol == ProtocolWebBanking and bankCode == "Bangkok Bank"
@@ -114,19 +135,6 @@ function InitializeSession(protocol, bankCode, username, reserved, password)
   connection.useragent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " ..
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
   connection.language = "en-US,en;q=0.9"
-
-  -- Proxy-Check
-  print("Proxy-Check: " .. PROXY .. "/__status__")
-  local ok, statusContent = pcall(function()
-    return connection:get(PROXY .. "/__status__")
-  end)
-  if not ok or not statusContent or statusContent == "" then
-    return "Bangkok Bank Proxy läuft nicht!\n\n" ..
-           "Bitte starte den Proxy zuerst in einem Terminal:\n\n" ..
-           "    python3 ~/Library/Application\\ Support/MoneyMoney/Extensions/bangkokbank_proxy.py\n\n" ..
-           "Der Proxy muss laufen, solange MoneyMoney Bangkok Bank abruft."
-  end
-  print("  Proxy OK")
 
   -- Cookies zurücksetzen
   pcall(function() connection:get(PROXY .. "/__reset__") end)
@@ -159,7 +167,7 @@ function InitializeSession(protocol, bankCode, username, reserved, password)
   local finalUrl = connection:getBaseURL()
   print("  finalUrl=" .. tostring(finalUrl))
 
-  if finalUrl:lower():find("signon") or finalUrl:lower():find("signin") then
+  if not finalUrl or finalUrl:lower():find("signon") or finalUrl:lower():find("signin") then
     print("  -> LoginFailed")
     return LoginFailed
   end
@@ -252,18 +260,27 @@ function RefreshAccount(account, since)
   local ac, ach = doPost(ACTIVITY_PATH, navBody, PROXY..SUMMARY_PATH)
   if not ac or #ac<200 then return "Activity-Seite nicht erreichbar." end
   local actPage = HTML(ac, ach)
-  local balance = amt(actPage:xpath("//*[contains(@id,'lblLedgerBal')]"):text())
+  local balRaw = actPage:xpath("//*[contains(@id,'lblLedgerBalVal')]"):text()
+  print("  balRaw='" .. tostring(balRaw) .. "'")
+  local balance = amt(balRaw)
 
   local now    = os.time()
   local fromTs = since and math.max(since, now-MAX_DAYS*86400) or (now-MAX_DAYS*86400)
+
+  -- Search-POST mit gewünschtem Datumsbereich versuchen.
+  -- Korrekte Felder laut HTML-Formular: DES_Group="", kein radDownloadTextFormat,
+  -- AcctID/AcctIndex/Be1stCardIndex/flagPost leer, SEP-Zeichen im ddlAccount-Wert.
+  local resPage = actPage  -- Fallback: actPage (Server-Standard ~28 Tage)
   local actTok = tokens(actPage)
-  local ddlVal = acctIndex..acctId.."001wsp_AccountActivity_Saving_Current.aspx"
+  local SEP = "\194\151"
+  local ddlVal = acctIndex..SEP..acctId..SEP.."001"..SEP.."wsp_AccountActivity_Saving_Current.aspx"
 
   local searchBody = form({
     {"__RequestVerificationToken",actTok["__RequestVerificationToken"]},
-    {"DES_Group","MAINGROUP"},
+    {"__EVENTTARGET",""},{"__EVENTARGUMENT",""},{"DES_Group",""},
     {"__VIEWSTATE",actTok["__VIEWSTATE"]},
     {"__VIEWSTATEGENERATOR",actTok["__VIEWSTATEGENERATOR"]},
+    {"__VIEWSTATEENCRYPTED",""},
     {"__PREVIOUSPAGE",actTok["__PREVIOUSPAGE"]},
     {"__EVENTVALIDATION",actTok["__EVENTVALIDATION"]},
     {"ctl00$ctl00$C$CN$NavAcctActivity1$ddlAccount",ddlVal},
@@ -274,21 +291,31 @@ function RefreshAccount(account, since)
     {"ctl00$ctl00$C$CW$IBCalendarDateTo$hidDateDisplay",dmy(now)},
     {"ctl00$ctl00$C$CW$IBCalendarDateTo$hidDateValue",mdy(now)},
     {"ctl00$ctl00$C$CW$btnOK","OK"},
+    {"AcctID",""},{"AcctIndex",""},{"Be1stCardIndex",""},{"flagPost",""},
     {"ctl00$ctl00$C$CW$hidErrorMsg","../images/ChequeImg_99_en.gif"},
-    {"ctl00$ctl00$C$radDownloadTextFormat","radDownloadTextFormat"},
   })
 
   local rc, rch = doPost(ACTIVITY_PATH, searchBody, PROXY..ACTIVITY_PATH)
-  if not rc or #rc<200 then return "Umsatzseite nicht erreichbar." end
-  local resPage = HTML(rc, rch)
-
-  local rb = amt(resPage:xpath("//*[contains(@id,'lblLedgerBal')]"):text())
-  if rb then balance=rb end
+  if rc and #rc>200 then
+    local rp = HTML(rc, rch)
+    local rb = amt(rp:xpath("//*[contains(@id,'lblLedgerBalVal')]"):text())
+    if rb then
+      resPage = rp
+      balance = rb
+      print("  Search-POST OK ("..dmy(fromTs).." – "..dmy(now)..")")
+    else
+      print("  Search-POST fehlgeschlagen, verwende actPage (Standard-Datumsbereich)")
+    end
+  else
+    print("  Search-POST fehlgeschlagen, verwende actPage (Standard-Datumsbereich)")
+  end
 
   local transactions = {}
+  local txCount = 0
   resPage:xpath(
     "//*[contains(@id,'gvAccountTrans') and contains(@id,'lblItemDate')]"
   ):each(function(_, dn)
+    txCount = txCount + 1
     local nid=dn:attr("id") or ""
     local prefix=nid:match("(.+_ctl%d+_)lblItemDate$")
     if not prefix then return end
@@ -297,7 +324,10 @@ function RefreshAccount(account, since)
     end
     local ds=(dn:text() or ""):match("^%s*(.-)%s*$")
     local bd=parseDate(ds)
-    if not bd then return end
+    if not bd then
+      print("  parseDate FAIL: '"..ds.."'")
+      return
+    end
     if since and bd<since then return end
     local deb=amt(c("lblItemDebit"))
     local cred=amt(c("lblItemCredit"))
@@ -312,7 +342,7 @@ function RefreshAccount(account, since)
   end)
 
   table.sort(transactions,function(a,b) return a.bookingDate>b.bookingDate end)
-  print("  Saldo="..tostring(balance).." Umsätze="..#transactions)
+  print("  txNodes="..txCount.." Saldo="..tostring(balance).." Umsätze="..#transactions)
   return {balance=balance or 0, transactions=transactions}
 end
 

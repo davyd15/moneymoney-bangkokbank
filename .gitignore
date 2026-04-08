@@ -1,0 +1,14 @@
+# HAR files (contain session tokens, cookies, sensitive network data)
+*.har
+
+# Claude Code internal files
+CLAUDE.md
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
