@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bangkok Bank iBanking Proxy for MoneyMoney  –  v13
+Bangkok Bank iBanking Proxy for MoneyMoney  –  v14
 ===================================================
 Hybrid architecture:
 - Login  (POST /SignOn.aspx):  Camoufox headless Firefox (Akamai JS challenge)
@@ -69,8 +69,9 @@ IDLE_TIMEOUT = 120    # Seconds of inactivity before automatic shutdown
 
 TARGET       = "https://ibanking.bangkokbank.com"
 SUMMARY_PATH = "/workspace/16AccountActivity/wsp_AccountSummary_AccountSummaryPage.aspx"
-CERT_FILE    = os.path.join(tempfile.gettempdir(), "bbl_cert.pem")
-KEY_FILE     = os.path.join(tempfile.gettempdir(), "bbl_key.pem")
+_CERT_DIR    = os.path.expanduser("~/Library/Application Support/BangkokBankProxy")
+CERT_FILE    = os.path.join(_CERT_DIR, "bbl_cert.pem")
+KEY_FILE     = os.path.join(_CERT_DIR, "bbl_key.pem")
 COOKIE_FILE  = os.path.join(tempfile.gettempdir(), "bbl_session.txt")
 
 CHROME_PATHS = [
@@ -132,6 +133,7 @@ class _PreBoundHTTPServer(http.server.HTTPServer):
 
 def ensure_tls_cert():
     """Create a self-signed certificate for localhost (one-time)."""
+    os.makedirs(_CERT_DIR, exist_ok=True)
     if os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE):
         return
     print("Creating self-signed TLS certificate for localhost...", flush=True)
@@ -415,7 +417,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             mode = "socket-activation" if SOCKET_ACTIVATION else "manual"
             self._reply(200, "application/json",
                 json.dumps({"status": "running", "target": TARGET,
-                            "version": 13, "mode": mode}))
+                            "version": 14, "mode": mode}))
             return
         if self.path == "/__reset__":
             reset_cookies()
@@ -490,7 +492,7 @@ if __name__ == "__main__":
         mode_info = "Manueller Start"
 
     login_method = "Camoufox headless" if USE_CAMOUFOX else "Chrome-CDP"
-    print(f"\nBangkok Bank Proxy v13  –  {mode_info}", flush=True)
+    print(f"\nBangkok Bank Proxy v14  –  {mode_info}", flush=True)
     print(f"  Login:   {login_method} + curl-cffi chrome124", flush=True)
     print(f"  Proxy:   https://127.0.0.1:{PORT}/  →  {TARGET}", flush=True)
     if not SOCKET_ACTIVATION:

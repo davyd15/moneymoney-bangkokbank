@@ -19,14 +19,15 @@
 --   2.15  Proxy v12: Camoufox headless Firefox replaces Chrome CDP (no Dock icon)
 --   2.16  Proxy v13: Socket Activation – proxy only runs on demand, not permanently
 --   2.17  Code cleanup: removed redundant debug prints
+--   2.18  Proxy v14: TLS cert stored permanently in ~/Library/Application Support/BangkokBankProxy
 --
--- Dependency: bangkokbank_proxy.py (v13) via LaunchAgent on port 8765
+-- Dependency: bangkokbank_proxy.py (v14) via LaunchAgent on port 8765
 --   Login: Camoufox headless Firefox (Akamai bypass, invisible)
 --   Start: automatically by launchd on demand (Socket Activation)
 --   Log:   /tmp/bbl_proxy.log
 
 WebBanking {
-  version     = 2.17,
+  version     = 2.18,
   url         = "https://127.0.0.1:8765",
   services    = {"Bangkok Bank"},
   description = "Bangkok Bank – Bualuang iBanking (via local proxy)"
