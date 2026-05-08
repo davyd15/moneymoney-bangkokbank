@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bangkok Bank iBanking Proxy for MoneyMoney  –  v14
+Bangkok Bank iBanking Proxy for MoneyMoney  –  v16
 ===================================================
 Hybrid architecture:
 - Login  (POST /SignOn.aspx):  Camoufox headless Firefox (Akamai JS challenge)
@@ -417,7 +417,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             mode = "socket-activation" if SOCKET_ACTIVATION else "manual"
             self._reply(200, "application/json",
                 json.dumps({"status": "running", "target": TARGET,
-                            "version": 14, "mode": mode}))
+                            "version": 15, "mode": mode}))
             return
         if self.path == "/__reset__":
             reset_cookies()
@@ -492,7 +492,7 @@ if __name__ == "__main__":
         mode_info = "Manueller Start"
 
     login_method = "Camoufox headless" if USE_CAMOUFOX else "Chrome-CDP"
-    print(f"\nBangkok Bank Proxy v14  –  {mode_info}", flush=True)
+    print(f"\nBangkok Bank Proxy v16  –  {mode_info}", flush=True)
     print(f"  Login:   {login_method} + curl-cffi chrome124", flush=True)
     print(f"  Proxy:   https://127.0.0.1:{PORT}/  →  {TARGET}", flush=True)
     if not SOCKET_ACTIVATION:

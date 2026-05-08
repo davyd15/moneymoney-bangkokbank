@@ -12,6 +12,7 @@ die()   { err "$*"; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EXTENSIONS_DIR="$HOME/Library/Containers/com.moneymoney-app.retail/Data/Library/Application Support/MoneyMoney/Extensions"
+PROXY_DIR="$HOME/Library/Application Support/BangkokBankProxy"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 PLIST_LABEL="com.bangkokbank.proxy"
 PLIST_PATH="$LAUNCH_AGENTS_DIR/$PLIST_LABEL.plist"
@@ -86,16 +87,18 @@ if [ ! -d "$EXTENSIONS_DIR" ]; then
     mkdir -p "$EXTENSIONS_DIR"
 fi
 
-cp "$SCRIPT_DIR/BangkokBank.lua"       "$EXTENSIONS_DIR/"
-cp "$SCRIPT_DIR/bangkokbank_proxy.py"  "$EXTENSIONS_DIR/"
-ok "BangkokBank.lua   → Extensions folder"
-ok "bangkokbank_proxy.py → Extensions folder"
+cp "$SCRIPT_DIR/BangkokBank.lua" "$EXTENSIONS_DIR/"
+ok "BangkokBank.lua → Extensions folder"
+
+mkdir -p "$PROXY_DIR"
+cp "$SCRIPT_DIR/bangkokbank_proxy.py" "$PROXY_DIR/"
+ok "bangkokbank_proxy.py → $PROXY_DIR"
 
 # ── 5. Generate and install LaunchAgent plist ─────────────────────────────────
 step "Installing LaunchAgent (proxy auto-start)..."
 
 mkdir -p "$LAUNCH_AGENTS_DIR"
-PROXY_SCRIPT="$EXTENSIONS_DIR/bangkokbank_proxy.py"
+PROXY_SCRIPT="$PROXY_DIR/bangkokbank_proxy.py"
 
 cat > "$PLIST_PATH" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
