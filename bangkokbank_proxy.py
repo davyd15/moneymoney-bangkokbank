@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bangkok Bank iBanking Proxy for MoneyMoney  –  v14
+Bangkok Bank iBanking Proxy for MoneyMoney  –  v17
 ===================================================
 Hybrid architecture:
 - Login  (POST /SignOn.aspx):  Camoufox headless Firefox (Akamai JS challenge)
@@ -203,17 +203,63 @@ def _save_cookies(playwright_cookies):
     print(f"  {len(playwright_cookies)} Cookies gespeichert", flush=True)
 
 
+DEBUG_HTML = os.path.join(tempfile.gettempdir(), "bbl_login_debug.html")
+DEBUG_PNG  = os.path.join(tempfile.gettempdir(), "bbl_login_debug.png")
+
+
+def _type_credentials(page, username, password):
+    """Enter User ID and Password into the Bangkok Bank login form.
+
+    The bank protects the fields with a 'DES / Secure One Character' (SOC)
+    JavaScript framework (DES_InitSOC + onpaste="return false"). It captures
+    each individual keystroke and stores the real value in a hidden field that
+    is submitted. page.fill() only sets the DOM value and fires a single input
+    event, so the hidden DES field stays empty and the login is rejected.
+    We must therefore click each field and type character by character so that
+    real keydown/keypress/keyup events fire."""
+    uid = page.locator('input[name="txiID"]')
+    uid.click()
+    uid.press_sequentially(username, delay=70)
+    pwd = page.locator('input[name="txiPwd"]')
+    pwd.click()
+    pwd.press_sequentially(password, delay=70)
+
+
+def _dump_login_debug(page, label):
+    """Save a screenshot + HTML of the page after the login attempt so a
+    failed login can be diagnosed (e.g. 'invalid password' vs. empty fields
+    vs. bot challenge)."""
+    try:
+        page.screenshot(path=DEBUG_PNG, full_page=True)
+        html = page.content()
+        with open(DEBUG_HTML, "w") as f:
+            f.write(html)
+        # Extract a short hint from any visible error/validation text
+        low = html.lower()
+        for marker in ("incorrect", "invalid", "not match", "try again",
+                       "locked", "blocked", "เลขที่", "รหัส"):
+            if marker in low:
+                idx = low.find(marker)
+                print(f"  {label}: page hint near '{marker}': "
+                      f"...{html[max(0,idx-60):idx+80]}...", flush=True)
+                break
+        print(f"  {label}: debug saved → {DEBUG_PNG} / {DEBUG_HTML}", flush=True)
+    except Exception as e:
+        print(f"  {label}: debug dump failed: {e}", flush=True)
+
+
 def _login_camoufox(username, password):
     """Login via Camoufox headless Firefox – kein sichtbares Fenster."""
     print(f"  Camoufox: Login als '{username}'...", flush=True)
     with _Camoufox(headless=True) as browser:
         page = browser.new_page()
         page.goto(TARGET + "/SignOn.aspx", wait_until="load", timeout=30000)
-        page.fill('input[name="txiID"]', username)
-        page.fill('input[name="txiPwd"]', password)
+        _type_credentials(page, username, password)
         page.click('input[name="btnLogOn"]')
         page.wait_for_load_state("load", timeout=30000)
         final_url = page.url
+        if "signon" in final_url.lower():
+            _dump_login_debug(page, "Camoufox")
         _save_cookies(page.context.cookies())
     return final_url
 
@@ -253,13 +299,14 @@ def _login_chrome_cdp(username, password):
             ctx  = browser.contexts[0] if browser.contexts else browser.new_context()
             page = ctx.pages[0]        if ctx.pages        else ctx.new_page()
             page.goto(TARGET + "/SignOn.aspx", wait_until="load", timeout=30000)
-            page.fill('input[name="txiID"]', username)
-            page.fill('input[name="txiPwd"]', password)
+            _type_credentials(page, username, password)
             page.click('input[name="btnLogOn"]')
             # Use "load" instead of "networkidle" – Akamai background scripts prevent
             # networkidle from ever being reached (→ 30s timeout → 502)
             page.wait_for_load_state("load", timeout=30000)
             final_url = page.url
+            if "signon" in final_url.lower():
+                _dump_login_debug(page, "Chrome-CDP")
             _save_cookies(ctx.cookies())
             try:
                 browser.close()
@@ -417,7 +464,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             mode = "socket-activation" if SOCKET_ACTIVATION else "manual"
             self._reply(200, "application/json",
                 json.dumps({"status": "running", "target": TARGET,
-                            "version": 14, "mode": mode}))
+                            "version": 17, "mode": mode}))
             return
         if self.path == "/__reset__":
             reset_cookies()
@@ -492,7 +539,7 @@ if __name__ == "__main__":
         mode_info = "Manueller Start"
 
     login_method = "Camoufox headless" if USE_CAMOUFOX else "Chrome-CDP"
-    print(f"\nBangkok Bank Proxy v14  –  {mode_info}", flush=True)
+    print(f"\nBangkok Bank Proxy v17  –  {mode_info}", flush=True)
     print(f"  Login:   {login_method} + curl-cffi chrome124", flush=True)
     print(f"  Proxy:   https://127.0.0.1:{PORT}/  →  {TARGET}", flush=True)
     if not SOCKET_ACTIVATION:
