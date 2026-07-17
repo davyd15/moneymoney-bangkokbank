@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bangkok Bank iBanking Proxy for MoneyMoney  –  v17
+Bangkok Bank iBanking Proxy for MoneyMoney  –  v18
 ===================================================
 Hybrid architecture:
 - Login  (POST /SignOn.aspx):  Camoufox headless Firefox (Akamai JS challenge)
@@ -226,26 +226,35 @@ def _type_credentials(page, username, password):
 
 
 def _dump_login_debug(page, label):
-    """Save a screenshot + HTML of the page after the login attempt so a
-    failed login can be diagnosed (e.g. 'invalid password' vs. empty fields
-    vs. bot challenge)."""
+    """Save a screenshot + HTML of the page after an unsuccessful login attempt
+    so the real reason can be diagnosed afterwards."""
     try:
         page.screenshot(path=DEBUG_PNG, full_page=True)
-        html = page.content()
         with open(DEBUG_HTML, "w") as f:
-            f.write(html)
-        # Extract a short hint from any visible error/validation text
-        low = html.lower()
-        for marker in ("incorrect", "invalid", "not match", "try again",
-                       "locked", "blocked", "เลขที่", "รหัส"):
-            if marker in low:
-                idx = low.find(marker)
-                print(f"  {label}: page hint near '{marker}': "
-                      f"...{html[max(0,idx-60):idx+80]}...", flush=True)
-                break
+            f.write(page.content())
         print(f"  {label}: debug saved → {DEBUG_PNG} / {DEBUG_HTML}", flush=True)
     except Exception as e:
         print(f"  {label}: debug dump failed: {e}", flush=True)
+
+
+# Bangkok Bank answers a login POST with its own "service unavailable" page
+# (error code UI-000) when the bank side is having trouble. That page is served
+# under the SignOn.aspx URL, so it must not be mistaken for rejected credentials.
+SERVICE_ERROR_MARKERS = (
+    "service is currently unavailable",
+    "(ui-000)",
+)
+
+
+def _classify_login(final_url, html):
+    """Classify the page reached after submitting the login form.
+    Returns 'ok', 'service_error' or 'login_failed'."""
+    low = (html or "").lower()
+    if any(m in low for m in SERVICE_ERROR_MARKERS):
+        return "service_error"
+    if "signon" in final_url.lower() or "signin" in final_url.lower():
+        return "login_failed"
+    return "ok"
 
 
 def _login_camoufox(username, password):
@@ -258,10 +267,11 @@ def _login_camoufox(username, password):
         page.click('input[name="btnLogOn"]')
         page.wait_for_load_state("load", timeout=30000)
         final_url = page.url
+        html = page.content()
         if "signon" in final_url.lower():
             _dump_login_debug(page, "Camoufox")
         _save_cookies(page.context.cookies())
-    return final_url
+    return final_url, html
 
 
 def _login_chrome_cdp(username, password):
@@ -305,6 +315,7 @@ def _login_chrome_cdp(username, password):
             # networkidle from ever being reached (→ 30s timeout → 502)
             page.wait_for_load_state("load", timeout=30000)
             final_url = page.url
+            html = page.content()
             if "signon" in final_url.lower():
                 _dump_login_debug(page, "Chrome-CDP")
             _save_cookies(ctx.cookies())
@@ -312,7 +323,7 @@ def _login_chrome_cdp(username, password):
                 browser.close()
             except Exception:
                 pass
-        return final_url
+        return final_url, html
     finally:
         if proc:
             try:
@@ -326,11 +337,12 @@ def _login_chrome_cdp(username, password):
 def browser_login(post_body):
     """
     Login dispatcher: Camoufox headless (preferred) or Chrome CDP (fallback).
-    Returns (success: bool, error: str|None).
-    On success: cookies saved to COOKIE_FILE.
+    Returns (result: str, error: str|None) where result is
+    'ok', 'service_error' or 'login_failed'.
+    On 'ok': cookies saved to COOKIE_FILE.
     """
     if not PLAYWRIGHT_AVAILABLE:
-        return False, "camoufox/playwright not installed"
+        return "login_failed", "camoufox/playwright not installed"
 
     params   = urllib.parse.parse_qs(
         post_body.decode('utf-8', errors='replace') if post_body else ""
@@ -339,23 +351,25 @@ def browser_login(post_body):
     password = params.get('txiPwd', [''])[0]
 
     if not username or not password:
-        return False, "No credentials in POST body"
+        return "login_failed", "No credentials in POST body"
 
     label = "Camoufox" if USE_CAMOUFOX else "Chrome-CDP"
     try:
-        final_url = _login_camoufox(username, password) if USE_CAMOUFOX \
-                    else _login_chrome_cdp(username, password)
+        final_url, html = _login_camoufox(username, password) if USE_CAMOUFOX \
+                          else _login_chrome_cdp(username, password)
 
-        if "signon" in final_url.lower() or "signin" in final_url.lower():
+        result = _classify_login(final_url, html)
+        if result == "service_error":
+            print(f"  {label}: Bank reports service unavailable (UI-000)", flush=True)
+        elif result == "login_failed":
             print(f"  {label}: Login failed (url={final_url})", flush=True)
-            return False, None
-
-        print(f"  {label}: Login OK (url={final_url})", flush=True)
-        return True, None
+        else:
+            print(f"  {label}: Login OK (url={final_url})", flush=True)
+        return result, None
 
     except Exception as e:
         print(f"  {label}: Exception: {e}", flush=True)
-        return False, str(e)
+        return "login_failed", str(e)
 
 
 def do_request(method, url, extra_headers=None, body=None):
@@ -464,7 +478,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             mode = "socket-activation" if SOCKET_ACTIVATION else "manual"
             self._reply(200, "application/json",
                 json.dumps({"status": "running", "target": TARGET,
-                            "version": 17, "mode": mode}))
+                            "version": 18, "mode": mode}))
             return
         if self.path == "/__reset__":
             reset_cookies()
@@ -483,11 +497,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # Browser login for POST /SignOn.aspx (Akamai JS challenge requires a real browser)
         if method == "POST" and "/signon" in self.path.lower():
-            ok, err = browser_login(body)
+            result, err = browser_login(body)
             if err:
                 self._reply(502, "text/plain", f"Login error: {err}")
                 return
-            if not ok:
+            if result == "service_error":
+                # Bank-seitiger Dienstfehler, keine falschen Zugangsdaten.
+                # Eigener Marker, damit die Lua eine klare Meldung zeigen kann.
+                self._reply(200, "text/html",
+                            b"<html><body>BBL_SERVICE_UNAVAILABLE: Bangkok Bank "
+                            b"reports that the service is currently unavailable "
+                            b"(UI-000).</body></html>")
+                return
+            if result != "ok":
                 # Falsche Zugangsdaten → SignOn-URL bleibt (→ LoginFailed im Lua)
                 self._reply(200, "text/html",
                             b"<html><body>Login failed</body></html>")
@@ -539,7 +561,7 @@ if __name__ == "__main__":
         mode_info = "Manueller Start"
 
     login_method = "Camoufox headless" if USE_CAMOUFOX else "Chrome-CDP"
-    print(f"\nBangkok Bank Proxy v17  –  {mode_info}", flush=True)
+    print(f"\nBangkok Bank Proxy v18  –  {mode_info}", flush=True)
     print(f"  Login:   {login_method} + curl-cffi chrome124", flush=True)
     print(f"  Proxy:   https://127.0.0.1:{PORT}/  →  {TARGET}", flush=True)
     if not SOCKET_ACTIVATION:

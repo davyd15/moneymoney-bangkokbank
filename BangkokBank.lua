@@ -20,14 +20,16 @@
 --   2.16  Proxy v13: Socket Activation – proxy only runs on demand, not permanently
 --   2.17  Code cleanup: removed redundant debug prints
 --   2.18  Proxy v14: TLS cert stored permanently in ~/Library/Application Support/BangkokBankProxy
+--   2.19  Proxy v17/v18: login types credentials character by character (DES keystroke
+--         protection); bank service error UI-000 is no longer reported as wrong credentials
 --
--- Dependency: bangkokbank_proxy.py (v14) via LaunchAgent on port 8765
+-- Dependency: bangkokbank_proxy.py (v18) via LaunchAgent on port 8765
 --   Login: Camoufox headless Firefox (Akamai bypass, invisible)
 --   Start: automatically by launchd on demand (Socket Activation)
 --   Log:   /tmp/bbl_proxy.log
 
 WebBanking {
-  version     = 2.18,
+  version     = 2.19,
   url         = "https://127.0.0.1:8765",
   services    = {"Bangkok Bank"},
   description = "Bangkok Bank – Bualuang iBanking (via local proxy)"
@@ -167,6 +169,16 @@ function InitializeSession(protocol, bankCode, username, reserved, password)
   local loginContent, loginCharset = doPost("/SignOn.aspx", body, SIGNON)
   local finalUrl = connection:getBaseURL()
   print("  finalUrl=" .. tostring(finalUrl))
+
+  -- The bank answers a login POST with its own error page (UI-000) when the
+  -- service is down. That page is served under the SignOn.aspx URL, so without
+  -- this check it would look like rejected credentials.
+  if loginContent and loginContent:find("BBL_SERVICE_UNAVAILABLE", 1, true) then
+    print("  -> service unavailable (UI-000)")
+    return "Bangkok Bank reports that iBanking is currently unavailable " ..
+           "(error UI-000). This is a problem on the bank's side, your " ..
+           "credentials are fine. Please try again later."
+  end
 
   if not finalUrl or finalUrl:lower():find("signon") or finalUrl:lower():find("signin") then
     print("  -> LoginFailed")
