@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Bangkok Bank iBanking Proxy for MoneyMoney  –  v18
+Bangkok Bank iBanking Proxy for MoneyMoney  –  v23
 ===================================================
 Hybrid architecture:
-- Login  (POST /SignOn.aspx):  Camoufox headless Firefox (Akamai JS challenge)
-                               Fallback: real Google Chrome via CDP
+- Login  (POST /SignOn.aspx):  headless Google Chrome via CDP with a spoofed
+                               non-headless identity (invisible). Fallbacks: visible
+                               Chrome, then Camoufox.
 - All subsequent requests:     curl-cffi Chrome124 impersonation with session cookies
 
 Socket Activation (normal operation as LaunchAgent):
@@ -13,12 +14,12 @@ Socket Activation (normal operation as LaunchAgent):
   launchd restarts it on the next request.
 
 One-time installation:
-    pip3 install curl-cffi camoufox --break-system-packages
-    python3 -m camoufox fetch
-
-Fallback (if Camoufox is not available):
-    pip3 install playwright --break-system-packages
+    pip3 install curl-cffi playwright --break-system-packages
     Google Chrome must be installed: /Applications/Google Chrome.app/
+
+Optional fallback (only used when Chrome is missing):
+    pip3 install camoufox --break-system-packages
+    python3 -m camoufox fetch
 
 Manual start (for testing):
     python3 bangkokbank_proxy.py
@@ -33,7 +34,7 @@ except Exception:
     pass
 
 import sys, ssl, shutil, ctypes, socket as _socket
-import subprocess, urllib.parse, urllib.request, time
+import subprocess, urllib.parse, urllib.request, time, re, platform
 
 try:
     from curl_cffi import Curl, CurlOpt, CurlHttpVersion, CurlInfo
@@ -43,28 +44,24 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from camoufox.sync_api import Camoufox as _Camoufox
     from playwright.sync_api import sync_playwright
     PLAYWRIGHT_AVAILABLE = True
-    USE_CAMOUFOX = True
-    print("Camoufox available – using headless Firefox for login.", flush=True)
 except ImportError:
-    try:
-        from playwright.sync_api import sync_playwright
-        PLAYWRIGHT_AVAILABLE = True
-        USE_CAMOUFOX = False
-        print("Camoufox nicht gefunden – Fallback auf Chrome-CDP.", flush=True)
-    except ImportError:
-        PLAYWRIGHT_AVAILABLE = False
-        USE_CAMOUFOX = False
-        print("WARNING: neither camoufox nor playwright installed – login will fail.", flush=True)
-        print("  pip3 install camoufox --break-system-packages && python3 -m camoufox fetch", flush=True)
+    PLAYWRIGHT_AVAILABLE = False
+    print("WARNING: playwright not installed – login will fail.", flush=True)
+    print("  pip3 install playwright --break-system-packages", flush=True)
+
+try:
+    from camoufox.sync_api import Camoufox as _Camoufox
+    CAMOUFOX_AVAILABLE = True
+except ImportError:
+    CAMOUFOX_AVAILABLE = False
 
 import http.server, socketserver, threading, json, os, tempfile, gzip, zlib
 from io import BytesIO
 
 PORT         = 8765
-CDP_PORT     = 9223   # Only for Chrome CDP fallback
+CDP_PORT     = 9223   # Chrome DevTools port used for the login
 IDLE_TIMEOUT = 120    # Seconds of inactivity before automatic shutdown
 
 TARGET       = "https://ibanking.bangkokbank.com"
@@ -229,10 +226,13 @@ def _dump_login_debug(page, label):
     """Save a screenshot + HTML of the page after an unsuccessful login attempt
     so the real reason can be diagnosed afterwards."""
     try:
-        page.screenshot(path=DEBUG_PNG, full_page=True)
         with open(DEBUG_HTML, "w") as f:
             f.write(page.content())
-        print(f"  {label}: debug saved → {DEBUG_PNG} / {DEBUG_HTML}", flush=True)
+        try:
+            page.screenshot(path=DEBUG_PNG, timeout=5000)
+        except Exception:
+            pass  # a minimized window cannot be captured; HTML is enough
+        print(f"  {label}: debug saved → {DEBUG_HTML}", flush=True)
     except Exception as e:
         print(f"  {label}: debug dump failed: {e}", flush=True)
 
@@ -274,26 +274,113 @@ def _login_camoufox(username, password):
     return final_url, html
 
 
-def _login_chrome_cdp(username, password):
-    """Login via real Google Chrome (CDP) – fallback when Camoufox is not available."""
+def _minimize_window(ctx, page):
+    """Minimize the login window so Chrome does not pop up in the user's face.
+
+    The window cannot simply be hidden: headless Chrome is refused by the bank's
+    Akamai protection at the network level (ERR_HTTP2_PROTOCOL_ERROR before the
+    page even loads), and macOS clamps off-screen window positions back onto the
+    display. Minimizing keeps a real, accepted Chrome out of sight, and
+    JavaScript keeps running while minimized. Non-fatal: a login in a visible
+    window is better than no login."""
+    try:
+        cdp = ctx.new_cdp_session(page)
+        window_id = cdp.send("Browser.getWindowForTarget")["windowId"]
+        cdp.send("Browser.setWindowBounds",
+                 {"windowId": window_id, "bounds": {"windowState": "minimized"}})
+    except Exception as e:
+        print(f"  Chrome: could not minimize window: {e}", flush=True)
+
+
+_CHROME_IDENTITY = None
+
+
+def _chrome_full_version(chrome):
+    try:
+        out = subprocess.run([chrome, "--version"], capture_output=True,
+                             text=True, timeout=10).stdout
+        m = re.search(r'(\d+\.\d+\.\d+\.\d+)', out)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def chrome_identity(chrome):
+    """Build a User-Agent + client-hint identity matching the installed Chrome,
+    so a *headless* Chrome presents itself exactly like the headed one.
+
+    Headless Chrome otherwise writes the token 'HeadlessChrome' into its
+    User-Agent and Sec-CH-UA header. The bank's Akamai edge rejects exactly that
+    token at the HTTP/2 level (ERR_HTTP2_PROTOCOL_ERROR) before the page even
+    loads. Overriding UA and client hints to the headed values — kept mutually
+    consistent, which Akamai also checks — lets a fully invisible headless Chrome
+    through. Values are derived from `chrome --version` and the OS so they
+    survive Chrome and macOS updates. Cached after the first build."""
+    global _CHROME_IDENTITY
+    if _CHROME_IDENTITY is not None:
+        return _CHROME_IDENTITY
+
+    full  = _chrome_full_version(chrome) or "150.0.0.0"
+    major = full.split(".")[0]
+    ua = (f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+          f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36")
+    try:
+        mac = platform.mac_ver()[0] or "26.0.0"
+    except Exception:
+        mac = "26.0.0"
+    arch = "arm" if platform.machine() == "arm64" else "x86"
+    # The GREASE brand is deliberately variable and meant to be ignored by
+    # servers, so a fixed plausible value is safe.
+    grease = {"brand": "Not;A=Brand", "version": "8"}
+    metadata = {
+        "brands": [grease,
+                   {"brand": "Chromium", "version": major},
+                   {"brand": "Google Chrome", "version": major}],
+        "fullVersionList": [{"brand": "Not;A=Brand", "version": "8.0.0.0"},
+                            {"brand": "Chromium", "version": full},
+                            {"brand": "Google Chrome", "version": full}],
+        "fullVersion": full, "platform": "macOS", "platformVersion": mac,
+        "architecture": arch, "model": "", "mobile": False,
+        "bitness": "64", "wow64": False,
+    }
+    _CHROME_IDENTITY = (ua, metadata)
+    return _CHROME_IDENTITY
+
+
+def _login_chrome_cdp(username, password, headless=True):
+    """Login via real Google Chrome (CDP).
+
+    Runs headless by default (fully invisible, no window, no dock icon) with an
+    overridden identity so the bank does not see it as headless (see
+    chrome_identity). headless=False launches a real visible window, then
+    minimizes it, as a fallback used only when headless is refused."""
     chrome = find_chrome()
     if not chrome:
         raise RuntimeError("Google Chrome not found at " + str(CHROME_PATHS))
 
-    print(f"  Chrome-CDP: Login als '{username}'...", flush=True)
+    ua, metadata = chrome_identity(chrome)
+    mode = "headless" if headless else "visible"
+    print(f"  Chrome ({mode}): Login als '{username}'...", flush=True)
     user_data_dir = tempfile.mkdtemp(prefix="bbl_chrome_")
     proc = None
     try:
-        proc = subprocess.Popen([
+        args = [
             chrome,
             f"--remote-debugging-port={CDP_PORT}",
             f"--user-data-dir={user_data_dir}",
+            f"--user-agent={ua}",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-default-apps",
             "--disable-extensions",
             "--disable-background-networking",
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ]
+        if headless:
+            args += ["--headless=new", "--window-size=1440,900"]
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
 
         for _ in range(20):
             time.sleep(0.5)
@@ -308,6 +395,12 @@ def _login_chrome_cdp(username, password):
                 f"http://localhost:{CDP_PORT}", timeout=15000)
             ctx  = browser.contexts[0] if browser.contexts else browser.new_context()
             page = ctx.pages[0]        if ctx.pages        else ctx.new_page()
+            if not headless:
+                _minimize_window(ctx, page)
+            cdp = ctx.new_cdp_session(page)
+            cdp.send("Network.enable")
+            cdp.send("Network.setUserAgentOverride",
+                     {"userAgent": ua, "userAgentMetadata": metadata})
             page.goto(TARGET + "/SignOn.aspx", wait_until="load", timeout=30000)
             _type_credentials(page, username, password)
             page.click('input[name="btnLogOn"]')
@@ -317,7 +410,7 @@ def _login_chrome_cdp(username, password):
             final_url = page.url
             html = page.content()
             if "signon" in final_url.lower():
-                _dump_login_debug(page, "Chrome-CDP")
+                _dump_login_debug(page, f"Chrome-{mode}")
             _save_cookies(ctx.cookies())
             try:
                 browser.close()
@@ -334,15 +427,44 @@ def _login_chrome_cdp(username, password):
         shutil.rmtree(user_data_dir, ignore_errors=True)
 
 
+def _run_login(login_fn, label, *fn_args):
+    """Run one login attempt and classify the outcome.
+    Returns (result: str, error: str|None). On an exception the error is set so
+    the caller can decide whether to fall back to another method."""
+    try:
+        final_url, html = login_fn(*fn_args)
+    except Exception as e:
+        print(f"  {label}: Exception: {e}", flush=True)
+        return "login_failed", str(e)
+
+    result = _classify_login(final_url, html)
+    if result == "service_error":
+        print(f"  {label}: Bank reports service unavailable (UI-000)", flush=True)
+    elif result == "login_failed":
+        print(f"  {label}: Login failed (url={final_url})", flush=True)
+    else:
+        print(f"  {label}: Login OK (url={final_url})", flush=True)
+    return result, None
+
+
 def browser_login(post_body):
     """
-    Login dispatcher: Camoufox headless (preferred) or Chrome CDP (fallback).
+    Login dispatcher. Preference order:
+      1. Headless Google Chrome with an overridden identity (fully invisible).
+      2. Visible (minimized) Google Chrome, only if headless is refused.
+      3. Camoufox headless, only if Google Chrome is not installed.
+
+    Real Chrome is used because the bank's Akamai protection rejects Camoufox's
+    spoofed fingerprint since the bank's system overhaul on 2026-06-20 (about 1
+    in 20 Camoufox launches gets through, real Chrome every time). Headless
+    Chrome is normally blocked at the HTTP/2 edge because of its 'HeadlessChrome'
+    identity token; chrome_identity() removes that so headless works invisibly.
+
     Returns (result: str, error: str|None) where result is
-    'ok', 'service_error' or 'login_failed'.
-    On 'ok': cookies saved to COOKIE_FILE.
+    'ok', 'service_error' or 'login_failed'. On 'ok': cookies saved.
     """
     if not PLAYWRIGHT_AVAILABLE:
-        return "login_failed", "camoufox/playwright not installed"
+        return "login_failed", "playwright not installed"
 
     params   = urllib.parse.parse_qs(
         post_body.decode('utf-8', errors='replace') if post_body else ""
@@ -353,23 +475,26 @@ def browser_login(post_body):
     if not username or not password:
         return "login_failed", "No credentials in POST body"
 
-    label = "Camoufox" if USE_CAMOUFOX else "Chrome-CDP"
-    try:
-        final_url, html = _login_camoufox(username, password) if USE_CAMOUFOX \
-                          else _login_chrome_cdp(username, password)
+    if find_chrome():
+        # The bank returns a sporadic UI-000 to fresh sessions regardless of the
+        # browser, so retry invisibly once before giving up invisibility. Only a
+        # genuine 'login_failed' (wrong credentials) stops the loop immediately;
+        # it is never retried. A 'service_error' or a launch/navigation error is
+        # retried, first headless again (stays invisible), then once with a
+        # visible (minimized) window as a last resort.
+        for label, headless in (("Chrome (headless)", True),
+                                 ("Chrome (headless retry)", True),
+                                 ("Chrome (visible)", False)):
+            result, err = _run_login(_login_chrome_cdp, label,
+                                     username, password, headless)
+            if result == "ok" or (result == "login_failed" and not err):
+                return result, err
+        return result, err
 
-        result = _classify_login(final_url, html)
-        if result == "service_error":
-            print(f"  {label}: Bank reports service unavailable (UI-000)", flush=True)
-        elif result == "login_failed":
-            print(f"  {label}: Login failed (url={final_url})", flush=True)
-        else:
-            print(f"  {label}: Login OK (url={final_url})", flush=True)
-        return result, None
+    if CAMOUFOX_AVAILABLE:
+        return _run_login(_login_camoufox, "Camoufox", username, password)
 
-    except Exception as e:
-        print(f"  {label}: Exception: {e}", flush=True)
-        return "login_failed", str(e)
+    return "login_failed", "neither Google Chrome nor camoufox available"
 
 
 def do_request(method, url, extra_headers=None, body=None):
@@ -478,7 +603,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             mode = "socket-activation" if SOCKET_ACTIVATION else "manual"
             self._reply(200, "application/json",
                 json.dumps({"status": "running", "target": TARGET,
-                            "version": 18, "mode": mode}))
+                            "version": 23, "mode": mode}))
             return
         if self.path == "/__reset__":
             reset_cookies()
@@ -560,8 +685,8 @@ if __name__ == "__main__":
         srv.socket = tls.wrap_socket(srv.socket, server_side=True)
         mode_info = "Manueller Start"
 
-    login_method = "Camoufox headless" if USE_CAMOUFOX else "Chrome-CDP"
-    print(f"\nBangkok Bank Proxy v18  –  {mode_info}", flush=True)
+    login_method = "Google Chrome (CDP)" if find_chrome() else "Camoufox headless"
+    print(f"\nBangkok Bank Proxy v23  –  {mode_info}", flush=True)
     print(f"  Login:   {login_method} + curl-cffi chrome124", flush=True)
     print(f"  Proxy:   https://127.0.0.1:{PORT}/  →  {TARGET}", flush=True)
     if not SOCKET_ACTIVATION:
